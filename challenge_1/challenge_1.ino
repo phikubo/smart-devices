@@ -1,82 +1,211 @@
+  /* Updated for ENA, IN1, IN2 wiring - IN2 moved to GPIO18 // cambiado porque 22 está ocupado */
+  #include <Arduino.h>
 
-const int BUTTON_PIN = 5;
-const int LED_PINS[] = {18, 19, 21, 22};
-const int NUM_LEDS = 4;
+  #include <Wire.h>
+  #include <LiquidCrystal_I2C.h>
 
-//Se establecen los estados de la secuencia.
-enum SequenceState {
-  STOPPED,
-  RUNNING
-};
+  // -------------------- CONFIGURACIÓN DE PINES --------------------
+  const int pinENA = 18; // PWM -> ENA
+  const int pinIN1 = 17; // Dirección 1 -> IN1
+  const int pinIN2 = 19; //  Dirección 2 -> IN2 
 
-//Se inicializa el estado actual de la secuencia en STOPPED.
-SequenceState currentState = STOPPED;
+  const int encA = 2;
+  const int encB = 4;
 
-//Variables para la configuración de los LEDS
-const long LED_INTERVAL = 1000;
-unsigned long lastLedChangeTime = 0;
-int currentLedIndex = 0;
+  // -------------------- PARÁMETROS DEL ENCODER --------------------
+  const unsigned int encoderPPR = 600;
 
-//Variables para la configuración del botón.
-const long DEBOUNCE_DELAY = 50;   //Se establece un tiempo para controlar el antirrebote
-int buttonState = HIGH;          // Estado inicial del botón.
-int lastButtonReading = HIGH;    // Última lectura del botón.
-unsigned long lastDebounceTime = 0;
+  // -------------------- PID --------------------
+  float Kp = 0.9;
+  float Ki = 0.4;
+  float Kd = 0.02;
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("--- Se inicializa la secuencia de LEDs. ---");
+  const unsigned long sampleTimeMs = 100;
 
-  for (int i = 0; i < NUM_LEDS; i++) {
-    pinMode(LED_PINS[i], OUTPUT);
-    digitalWrite(LED_PINS[i], LOW);
+  // -------------------- LÍMITES DE SETPOINT --------------------
+  const int RPM_MAX = 150;
+  const int RPM_MIN = -150;
+
+  // -------------------- VARIABLES GLOBALES --------------------
+  volatile long encCount = 0;
+  float setpointRPM = 0.0;
+  float measuredRPM = 0.0;
+  float errorRPM = 0.0;
+  float integralTerm = 0.0;
+  float lastError = 0.0;
+  unsigned long lastSampleTime = 0;
+
+  bool waitingForSetpoint = false;
+  LiquidCrystal_I2C lcd(0x27, 16, 2);
+  String inputBuffer = "";
+
+  void IRAM_ATTR onEncoderA() {
+    int b = digitalRead(encB);
+    if (b == HIGH) encCount++;
+    else encCount--;
   }
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  Serial.println("Presiona el botón para iniciar la secuencia.");
-}
+  void setupHardware() {
+    pinMode(pinIN1, OUTPUT);
+    pinMode(pinIN2, OUTPUT);
+    pinMode(encA, INPUT_PULLUP);
+    pinMode(encB, INPUT_PULLUP);
 
-void loop() {
-  readAndDebounceButton();
+    const int pwmChannel = 0;
+      ledcSetup(pwmChannel, 20000, 8);
+    ledcAttachPin(pinENA, pwmChannel);
 
-  if (currentState == RUNNING) {
-    runSequence();
+    attachInterrupt(digitalPinToInterrupt(encA), onEncoderA, CHANGE);
+
+    lcd.init();
+    lcd.backlight();
+
+    ledcWrite(pwmChannel, 0);
+    digitalWrite(pinIN1, LOW);
+    digitalWrite(pinIN2, LOW);
   }
-}
 
-void readAndDebounceButton() {
-  int reading = digitalRead(BUTTON_PIN);
-
-  if (reading != lastButtonReading) {
-    lastDebounceTime = millis();
+  void emergencyStop() {
+    const int pwmChannel = 0;
+    ledcWrite(pwmChannel, 0);
+    digitalWrite(pinIN1, LOW);
+    digitalWrite(pinIN2, LOW);
+    setpointRPM = 0.0;
+    integralTerm = 0.0;
   }
 
-  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
-    if (reading != buttonState) {
-      buttonState = reading;
+  float computeRPM(long deltaCounts, unsigned long dtMs) {
+    if (dtMs == 0) return 0.0;
+    float revs = ((float)deltaCounts) / (float)encoderPPR;
+    float rpm = revs * (60000.0f / (float)dtMs);
+    return rpm;
+  }
 
-      if (buttonState == LOW) { // Validar si se presiona el botón para iniciar y parar la secuencia
-        currentState = (currentState == STOPPED) ? RUNNING : STOPPED;
-        Serial.print("Estado de secuencia: ");
-        Serial.println((currentState == RUNNING) ? "RUNNING" : "STOPPED");
+  bool parseSignedInt(const String &s, int &outVal) {
+    String t = s;
+    t.trim();
+    if (t.length() == 0) return false;
+    int sign = 1;
+    int start = 0;
+    if (t.charAt(0) == '+') { sign = 1; start = 1; }
+    else if (t.charAt(0) == '-') { sign = -1; start = 1; }
+    if (start >= t.length()) return false;
+    long val = 0;
+    for (int i = start; i < t.length(); ++i) {
+      char c = t.charAt(i);
+      if (c < '0' || c > '9') return false;
+      val = val * 10 + (c - '0');
+    }
+    outVal = (int)(sign * val);
+    return true;
+  }
+
+  void applyControl(float effort) {
+    const int pwmChannel = 0;
+
+    if (effort >= 0) {
+      digitalWrite(pinIN1, HIGH);
+      digitalWrite(pinIN2, LOW);
+    } else {
+      digitalWrite(pinIN1, LOW);
+      digitalWrite(pinIN2, HIGH);
+    }
+
+    float mag = fabs(effort);
+    if (mag > 1.0) mag = 1.0;
+
+    int pwmVal = (int)(mag * 255.0);
+    ledcWrite(pwmChannel, pwmVal);
+  }
+
+  void controlLoop() {
+    unsigned long now = millis();
+    if (now - lastSampleTime < sampleTimeMs) return;
+    unsigned long dt = now - lastSampleTime;
+    lastSampleTime = now;
+
+    long countSnapshot;
+    noInterrupts();
+    countSnapshot = encCount;
+    encCount = 0;
+    interrupts();
+
+    measuredRPM = computeRPM(countSnapshot, dt);
+    errorRPM = setpointRPM - measuredRPM;
+
+    integralTerm += errorRPM * ((float)dt / 1000.0f);
+    float integralLimit = 300.0f;
+    if (integralTerm > integralLimit) integralTerm = integralLimit;
+    if (integralTerm < -integralLimit) integralTerm = -integralLimit;
+
+    float derivative = (errorRPM - lastError) / ((float)dt / 1000.0f);
+    float u = Kp * errorRPM + Ki * integralTerm + Kd * derivative;
+
+    float salidaMaxRPM = 200.0f;
+    if (u > salidaMaxRPM) u = salidaMaxRPM;
+    if (u < -salidaMaxRPM) u = -salidaMaxRPM;
+
+    applyControl(u / salidaMaxRPM);
+    lastError = errorRPM;
+  }
+
+  void updateLCD() {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.printf("SP:%+4.0f RPM", setpointRPM);
+    lcd.setCursor(0,1);
+    lcd.printf("M:%+4.0f E:%+4.0f", measuredRPM, errorRPM);
+  }
+
+  void updateSerialStatus() {
+    Serial.print("SETPOINT: "); Serial.print((int)setpointRPM);
+    Serial.print(" RPM	MED: "); Serial.print((int)measuredRPM);
+    Serial.print(" RPM	ERR: "); Serial.println((int)errorRPM);
+  }
+
+  void setup() {
+    Serial.begin(115200);
+    setupHardware();
+    Serial.println("Control Motor ENA/IN1/IN2 listo! Presiona 's' o 'x'");
+    lastSampleTime = millis();
+  }
+
+  void loop() {
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (!waitingForSetpoint) {
+        if (c == 's' || c == 'S') {
+          waitingForSetpoint = true;
+          inputBuffer = "";
+          Serial.println("Ingrese setpoint (ej: -120) y ENTER");
+        } else if (c == 'x' || c == 'X') {
+          Serial.println("PARADA INMEDIATA");
+          emergencyStop();
+        }
+      } else {
+        if (c == '\n') {
+          int val;
+          if (parseSignedInt(inputBuffer, val) && val >= RPM_MIN && val <= RPM_MAX) {
+            setpointRPM = val;
+            Serial.print("Setpoint OK: "); Serial.println(val);
+          } else {
+            Serial.println("ERROR: Setpoint inválido");
+          }
+          waitingForSetpoint = false;
+        } else if (c != '\n') {
+          inputBuffer += c;
+          Serial.print(c);
+        }
       }
     }
+
+    controlLoop();
+
+    static unsigned long lastUI = 0;
+    unsigned long now = millis();
+    if (now - lastUI > 500) {
+      updateLCD();
+      updateSerialStatus();
+      lastUI = now;
+    }
   }
-
-  lastButtonReading = reading;
-}
-
-void runSequence() {
-  unsigned long currentMillis = millis();
-
-  if (currentMillis - lastLedChangeTime >= LED_INTERVAL) {
-    lastLedChangeTime = currentMillis;
-
-    digitalWrite(LED_PINS[currentLedIndex], LOW);
-    currentLedIndex = (currentLedIndex + 1) % NUM_LEDS;
-    digitalWrite(LED_PINS[currentLedIndex], HIGH);
-
-    Serial.print("LED activo: ");
-    Serial.println(currentLedIndex);
-  }
-}
